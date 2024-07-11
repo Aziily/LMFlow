@@ -73,3 +73,13 @@ There are also some optional arguments for the script:
 - `img_size`: The size of the image for fine-tuning, validation and testing. Default is `768`.
 
 For more customization, you can refer to the [run_finetune_t2i.sh](./run_finetune_t2i.sh) and  example [finetune_t2i.py](../../examples/finetune_t2i.py).
+
+This script only support Unet-based Diffusion models like Stable-Diffusion-1-\*/2-\*, if you want to finetune Stable-Diffusion-3, please use the script below:
+
+```bash
+bash scripts/diffuser/run_finetune_t2i_sd3.sh \
+    --model_name_or_path "v2ray/stable-diffusion-3-medium-diffusers" \
+    --dataset_path "data/example"
+```
+
+The dataset format and the optional arguments are the same as the above script.

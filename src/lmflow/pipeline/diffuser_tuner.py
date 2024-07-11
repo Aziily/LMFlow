@@ -18,13 +18,16 @@ from diffusers import (
     DiffusionPipeline,
     UNet2DConditionModel,
     DDPMScheduler,
+    FlowMatchEulerDiscreteScheduler,
 )
 from diffusers.loaders import LoraLoaderMixin
 from diffusers.utils import (
     convert_state_dict_to_diffusers,
     convert_unet_state_dict_to_peft,
+    check_min_version,
 )
 from diffusers.utils.torch_utils import is_compiled_module
+from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
 from diffusers.optimization import get_scheduler
 from accelerate import Accelerator
 from peft.utils import get_peft_model_state_dict, set_peft_model_state_dict
@@ -112,7 +115,24 @@ class DiffuserModelTuner(BaseTuner):
     ):
         dataloader = DataLoader(dataset=dataset.backend_dataset, batch_size=self.finetuner_args.train_batch_size, shuffle=True)
         
-        noise_scheduler = DDPMScheduler.from_pretrained(self.model_args.model_name_or_path, subfolder="scheduler")
+        if self.model_args.arch_type == "SD3transformer2D":
+            check_min_version("0.30.0.dev0")
+            noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+                self.model_args.model_name_or_path, subfolder="scheduler"
+            )
+            noise_scheduler_copy = copy.deepcopy(noise_scheduler)
+            def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
+                sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
+                schedule_timesteps = noise_scheduler_copy.timesteps.to(accelerator.device)
+                timesteps = timesteps.to(accelerator.device)
+                step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+
+                sigma = sigmas[step_indices].flatten()
+                while len(sigma.shape) < n_dim:
+                    sigma = sigma.unsqueeze(-1)
+                return sigma
+        else:
+            noise_scheduler = DDPMScheduler.from_pretrained(self.model_args.model_name_or_path, subfolder="scheduler")
         
         def unwrap_model(model):
             model = accelerator.unwrap_model(model)
@@ -121,7 +141,7 @@ class DiffuserModelTuner(BaseTuner):
         
         # filter trainable parameters
         params_to_optimize = list(filter(lambda p: p.requires_grad, model.parameters()))
-        accelerator.print(len(params_to_optimize))
+        accelerator.print(f"params to be optimized: {len([params_to_optimize])}")
         
         optimizer = torch.optim.AdamW(
             params_to_optimize,
@@ -151,29 +171,57 @@ class DiffuserModelTuner(BaseTuner):
         for epoch in range(self.finetuner_args.num_train_epochs):
             model.train()
             for batch in dataloader:
+                added_kwargs = {}
                 clean_latents = batch["image"].to(dtype=weight_dtype)
                 text_embedding = batch["text"].to(dtype=weight_dtype)
                 
                 bsz, channel, height, width = clean_latents.shape
                 noise = torch.randn_like(clean_latents).to(dtype=weight_dtype)
-                timesteps = torch.randint(
-                    0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_latents.device
-                )
-                timesteps = timesteps.long()
+                if self.data_args.preprocessor_kind == "SD3":
+                    pooled_text_embedding = batch["pool_text"].to(dtype=weight_dtype)
+                    added_kwargs["pooled_projections"] = pooled_text_embedding
+                    u = compute_density_for_timestep_sampling(
+                        weighting_scheme="logit_normal",
+                        batch_size=bsz,
+                        logit_mean=0.0,
+                        logit_std=1.0,
+                    )
+                    indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
+                    timesteps = noise_scheduler_copy.timesteps[indices].to(device=clean_latents.device)
+
+                    # Add noise according to flow matching.
+                    sigmas = get_sigmas(timesteps, n_dim=clean_latents.ndim, dtype=clean_latents.dtype)
+                    noisy_latents = sigmas * noise + (1.0 - sigmas) * clean_latents
+                else:
+                    timesteps = torch.randint(
+                        0, noise_scheduler.config.num_train_timesteps, (bsz,), device=clean_latents.device
+                    )
+                    timesteps = timesteps.long()
+                    noisy_latents = noise_scheduler.add_noise(clean_latents, noise, timesteps)
                 
-                noisy_latents = noise_scheduler.add_noise(clean_latents, noise, timesteps)
                 model_pred = model(
-                    noisy_latents, timesteps, text_embedding,
+                    noisy_latents, timestep=timesteps, encoder_hidden_states=text_embedding, **added_kwargs,
                 )[0]
                 
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(clean_latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                if self.data_args.preprocessor_kind == "SD3":
+                    model_pred = model_pred * (-sigmas) + noisy_latents
+                    weighting = compute_loss_weighting_for_sd3(weighting_scheme="logit_normal", sigmas=sigmas)
+                    target = clean_latents
                 
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    loss = torch.mean(
+                        (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
+                        1,
+                    )
+                    loss = loss.mean()
+                else:
+                    if noise_scheduler.config.prediction_type == "epsilon":
+                        target = noise
+                    elif noise_scheduler.config.prediction_type == "v_prediction":
+                        target = noise_scheduler.get_velocity(clean_latents, noise, timesteps)
+                    else:
+                        raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+                    
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
                 
                 accelerator.backward(loss)
                 optimizer.step()
@@ -198,7 +246,7 @@ class DiffuserModelTuner(BaseTuner):
                             )
                             if self.model_args.arch_type == "unet":
                                 pipeline.unet = unwrap_model(model)
-                            elif self.model_args.arch_type == "transformer":
+                            elif self.model_args.arch_type == "transformer" or self.model_args.arch_type == "SD3transformer2D":
                                 pipeline.transformer = unwrap_model(model)
                             else:
                                 raise ValueError(f"Unknown model type {self.model_args.arch_type}")
@@ -248,7 +296,7 @@ class DiffuserModelTuner(BaseTuner):
                 )
                 if self.model_args.arch_type == "unet":
                     pipeline.unet = unwrap_model(model)
-                elif self.model_args.arch_type == "transformer":
+                elif self.model_args.arch_type == "transformer" or self.model_args.arch_type == "SD3transformer2D":
                     pipeline.transformer = unwrap_model(model)
                 else:
                     raise ValueError(f"Unknown model type {self.model_args.arch_type}")
